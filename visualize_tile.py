@@ -1,138 +1,419 @@
 #!/usr/bin/env python3
 """
-Simple script to visualize a random tile with buildings overlaid.
+Simple tile visualization script for RoofGraph dataset.
+
+This script visualizes a specific tile with its buildings drawn on it.
 """
 
 import json
 import pathlib
-import random
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import rasterio
-from rasterio.windows import Window
+import matplotlib.patches as patches
+from matplotlib.collections import LineCollection
+import sys
 
-def load_building(building_path, building_id):
-    """Load a single building JSON file."""
-    building_file = building_path / f"{building_id}.json"
-    with open(building_file, 'r') as f:
+# Optional imports
+try:
+    import rasterio
+    from rasterio.windows import Window
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    RASTERIO_AVAILABLE = False
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+if not RASTERIO_AVAILABLE and not PIL_AVAILABLE:
+    print("Warning: Neither rasterio nor PIL available. Image background will not be shown.")
+
+
+def load_tile_mapping(data_path):
+    """Load the tile to buildings mapping."""
+    tile_mapping_path = data_path / "tile_to_buildings.json"
+    if not tile_mapping_path.exists():
+        print(f"Error: Tile mapping file not found: {tile_mapping_path}")
+        return None
+    
+    with open(tile_mapping_path, 'r') as f:
         return json.load(f)
 
-def visualize_tile(tile_key, buildings_in_tile, data_path):
-    """Visualize a single tile with its buildings."""
+
+def load_building_data(buildings_path, building_ids):
+    """Load building data for specific building IDs."""
+    buildings = {}
+    for building_id in building_ids:
+        building_file = buildings_path / f"{building_id}.json"
+        if building_file.exists():
+            try:
+                with open(building_file, 'r') as f:
+                    buildings[building_id] = json.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load building {building_id}: {e}")
+        else:
+            print(f"Warning: Building file not found: {building_file}")
     
-    # Parse tile key: "image_id_x_y_tile_size"
-    parts = tile_key.split("_")
-    image_id = "_".join(parts[:-3])  # Everything except last 3 parts
+    return buildings
+
+
+def parse_tile_key(tile_key):
+    """Parse tile key to extract image_id, x, y, and tile_size."""
+    # Format: image_id_x_y_tile_size
+    parts = tile_key.split('_')
+    if len(parts) < 4:
+        raise ValueError(f"Invalid tile key format: {tile_key}")
+    
+    # Find the last 3 parts (x, y, tile_size)
     x = int(parts[-3])
     y = int(parts[-2])
     tile_size = int(parts[-1])
     
+    # Everything before the last 3 parts is the image_id
+    image_id = '_'.join(parts[:-3])
+    
+    return image_id, x, y, tile_size
+
+
+def load_tile_image(image_path, x, y, tile_size):
+    """Load a tile from a GeoTIFF image."""
+    if RASTERIO_AVAILABLE:
+        try:
+            with rasterio.open(image_path) as src:
+                # Create window for the tile
+                window = Window(x, y, tile_size, tile_size)
+                
+                # Read the tile
+                tile_data = src.read(window=window)
+                
+                # Handle different band configurations
+                if tile_data.shape[0] == 1:
+                    # Grayscale to RGB
+                    tile_data = np.stack([tile_data[0]] * 3, axis=0)
+                elif tile_data.shape[0] == 3:
+                    # Already RGB
+                    pass
+                elif tile_data.shape[0] == 4:
+                    # RGBA to RGB (drop alpha channel)
+                    tile_data = tile_data[:3]
+                else:
+                    # Take first 3 bands
+                    tile_data = tile_data[:3]
+                
+                # Transpose to (height, width, channels)
+                tile_data = np.transpose(tile_data, (1, 2, 0))
+                
+                # Normalize to 0-1 range
+                tile_data = tile_data.astype(np.float32)
+                if tile_data.max() > 1.0:
+                    tile_data = tile_data / 255.0
+                
+                return tile_data
+        except Exception as e:
+            print(f"Warning: Could not load tile image with rasterio: {e}")
+    
+    # Fallback to PIL if rasterio is not available
+    if PIL_AVAILABLE:
+        try:
+            # Load the full image with PIL
+            with Image.open(image_path) as img:
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Crop to the tile region
+                tile_img = img.crop((x, y, x + tile_size, y + tile_size))
+                
+                # Convert to numpy array
+                tile_data = np.array(tile_img, dtype=np.float32) / 255.0
+                
+                return tile_data
+        except Exception as e:
+            print(f"Warning: Could not load tile image with PIL: {e}")
+    
+    return None
+
+
+def get_building_corners_in_tile(building, image_id, tile_x, tile_y, tile_size):
+    """Get building corners for visualization, using any available image data."""
+    # Try to get corners from the specific image first
+    corners = None
+    if image_id in building.get('corners', {}):
+        corners = building['corners'][image_id]
+    
+    # If no corners in this image, try to find corners from any other image
+    if not corners or len(corners) == 0:
+        for other_image_id, other_corners in building.get('corners', {}).items():
+            if len(other_corners) > 0:
+                corners = other_corners
+                print(f"Using corners from image {other_image_id} for building {building.get('id', 'unknown')}")
+                break
+    
+    if not corners or len(corners) == 0:
+        return []
+    
+    # Convert to numpy array for easier processing
+    corners_array = np.array(corners)
+    
+    # Convert all corners to tile-relative coordinates
+    # We'll show the full building even if it extends outside the tile
+    relative_corners = []
+    for corner in corners_array:
+        # Convert to tile-relative coordinates
+        rel_x = corner[0] - tile_x
+        rel_y = corner[1] - tile_y
+        
+        # Don't clip to tile bounds - show the full building even if it extends outside
+        relative_corners.append([rel_x, rel_y])
+    
+    return relative_corners
+
+
+def get_building_edges_in_tile(building, image_id, tile_x, tile_y, tile_size):
+    """Get building edges for visualization, using any available image data."""
+    # Try to get corners from the specific image first
+    corners = None
+    if image_id in building.get('corners', {}):
+        corners = building['corners'][image_id]
+    
+    # If no corners in this image, try to find corners from any other image
+    if not corners or len(corners) == 0:
+        for other_image_id, other_corners in building.get('corners', {}).items():
+            if len(other_corners) > 0:
+                corners = other_corners
+                break
+    
+    if not corners or len(corners) == 0 or 'edges' not in building:
+        return []
+    
+    # Convert to numpy array for easier processing
+    corners_array = np.array(corners)
+    
+    # Get all edges and convert to tile-relative coordinates
+    edges = []
+    for i, connected_corners in enumerate(building['edges']):
+        for connected_idx in connected_corners:
+            if connected_idx < len(corners_array):
+                # Convert to tile-relative coordinates
+                corner1 = corners_array[i]
+                corner2 = corners_array[connected_idx]
+                
+                rel_corner1 = [
+                    corner1[0] - tile_x,
+                    corner1[1] - tile_y
+                ]
+                rel_corner2 = [
+                    corner2[0] - tile_x,
+                    corner2[1] - tile_y
+                ]
+                
+                edges.append([rel_corner1, rel_corner2])
+    
+    return edges
+
+
+def visualize_tile(tile_key, data_path, show_image=True, save_path=None):
+    """Visualize a tile with its buildings."""
     print(f"Visualizing tile: {tile_key}")
-    print(f"Image: {image_id}")
-    print(f"Position: ({x}, {y})")
-    print(f"Size: {tile_size}x{tile_size}")
-    print(f"Buildings in tile: {len(buildings_in_tile)}")
     
-    # Paths
+    # Parse tile key
+    try:
+        image_id, tile_x, tile_y, tile_size = parse_tile_key(tile_key)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+    
+    print(f"Image ID: {image_id}")
+    print(f"Tile position: ({tile_x}, {tile_y})")
+    print(f"Tile size: {tile_size}x{tile_size}")
+    
+    # Load tile mapping
+    tile_mapping = load_tile_mapping(data_path)
+    if tile_mapping is None:
+        return
+    
+    if tile_key not in tile_mapping:
+        print(f"Error: Tile {tile_key} not found in mapping")
+        return
+    
+    building_ids = tile_mapping[tile_key]
+    print(f"Found {len(building_ids)} buildings in this tile")
+    
+    # Load building data
     buildings_path = data_path / "buildings_transformed"
-    cog_path = data_path / "COG"
+    buildings = load_building_data(buildings_path, building_ids)
     
-    # Load the image tile
-    image_file = cog_path / f"{image_id}.tif"
-    print(f"Loading image: {image_file}")
+    if not buildings:
+        print("No building data loaded")
+        return
     
-    with rasterio.open(image_file) as src:
-        # Create window for this tile
-        window = Window(x, y, tile_size, tile_size)
+    # Load tile image if available
+    tile_image = None
+    if show_image and RASTERIO_AVAILABLE:
+        image_path = data_path / "COG" / f"{image_id}.tif"
+        if image_path.exists():
+            tile_image = load_tile_image(image_path, tile_x, tile_y, tile_size)
+        else:
+            print(f"Warning: Image file not found: {image_path}")
+    
+    # Create visualization
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    
+    # Show tile image as background if available
+    if tile_image is not None:
+        ax.imshow(tile_image, extent=[0, tile_size, tile_size, 0], origin='upper')
+        print(f"Loaded tile image with shape: {tile_image.shape}")
+    else:
+        # Create a white background
+        ax.set_facecolor('white')
+        print("No background image available")
+    
+    # Set up the plot - first collect all building coordinates to determine full extent
+    all_x_coords = []
+    all_y_coords = []
+    
+    for building_id, building in buildings.items():
+        corners = get_building_corners_in_tile(building, image_id, tile_x, tile_y, tile_size)
+        if corners:
+            corners_array = np.array(corners)
+            all_x_coords.extend(corners_array[:, 0])
+            all_y_coords.extend(corners_array[:, 1])
+    
+    if all_x_coords and all_y_coords:
+        # Add some padding around the buildings
+        x_min, x_max = min(all_x_coords), max(all_x_coords)
+        y_min, y_max = min(all_y_coords), max(all_y_coords)
+        padding = 50
         
-        # Read the tile
-        tile_image = src.read(window=window, boundless=True, fill_value=0)
-        # Convert from (channels, height, width) to (height, width, channels)
-        tile_image = np.moveaxis(tile_image, 0, -1)
+        ax.set_xlim(x_min - padding, x_max + padding)
+        ax.set_ylim(y_max + padding, y_min - padding)  # Flip Y axis to match image coordinates
+    else:
+        # Fallback to tile bounds if no buildings found
+        ax.set_xlim(0, tile_size)
+        ax.set_ylim(tile_size, 0)  # Flip Y axis to match image coordinates
     
-    # Create the plot
-    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_aspect('equal')
+    ax.set_title(f'Tile: {tile_key}\nBuildings: {len(buildings)}', fontsize=14, fontweight='bold')
+    ax.set_xlabel('X (pixels)', fontsize=12)
+    ax.set_ylabel('Y (pixels)', fontsize=12)
     
-    # Show the image
-    ax.imshow(tile_image, extent=[0, tile_size, tile_size, 0])
+    # Draw buildings with more visible colors
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
     
-    # Plot buildings
-    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
-    
-    for i, building_id in enumerate(buildings_in_tile):
-        building = load_building(buildings_path, building_id)
-        
-        if image_id not in building["corners"]:
-            print(f"Warning: Building {building_id} has no corners for image {image_id}")
-            continue
-        
-        corners = np.array(building["corners"][image_id])
-        if len(corners) == 0:
-            continue
-        
-        # Adjust corners relative to the tile position
-        adjusted_corners = corners - [x, y]
-        
-        # Choose color for this building
+    for i, (building_id, building) in enumerate(buildings.items()):
         color = colors[i % len(colors)]
         
-        # Plot building edges
-        if "edges" in building:
-            for corner_idx, connected_corners in enumerate(building["edges"]):
-                if corner_idx < len(adjusted_corners):
-                    corner1 = adjusted_corners[corner_idx]
-                    for connected_idx in connected_corners:
-                        if connected_idx < len(adjusted_corners):
-                            corner2 = adjusted_corners[connected_idx]
-                            ax.plot([corner1[0], corner2[0]], [corner1[1], corner2[1]], 
-                                   color=color, linewidth=2, alpha=0.8)
+        # Get building corners in tile coordinates
+        corners = get_building_corners_in_tile(building, image_id, tile_x, tile_y, tile_size)
         
-        # Plot building corners
-        ax.scatter(adjusted_corners[:, 0], adjusted_corners[:, 1], 
-                  color=color, s=50, alpha=0.8, label=f'Building {building_id}')
+        # Always draw buildings that are connected to this tile, regardless of corner count
+        if len(corners) > 0:
+            # Draw building edges only (no filled polygon)
+            edges = get_building_edges_in_tile(building, image_id, tile_x, tile_y, tile_size)
+            if edges:
+                edge_lines = LineCollection(edges, colors=color, linewidths=2, alpha=0.9)
+                ax.add_collection(edge_lines)
+            
+            # Draw small keypoints at corners
+            for corner in corners:
+                ax.plot(corner[0], corner[1], 'o', color=color, markersize=4, alpha=0.8)
+            
+            # Add building ID label at centroid with better visibility
+            if len(corners) >= 2:
+                centroid = np.mean(corners, axis=0)
+                
+                # Clip centroid to tile bounds for label positioning
+                label_x = max(20, min(tile_size - 20, centroid[0]))
+                label_y = max(20, min(tile_size - 20, centroid[1]))
+                
+                ax.text(label_x, label_y, str(building_id), 
+                       ha='center', va='center', fontsize=8, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                               edgecolor=color, alpha=0.9))
+            else:
+                # For single corner buildings, place label near the corner
+                corner = corners[0]
+                label_x = max(20, min(tile_size - 20, corner[0] + 10))
+                label_y = max(20, min(tile_size - 20, corner[1] + 10))
+                
+                ax.text(label_x, label_y, str(building_id), 
+                       ha='center', va='center', fontsize=8, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                               edgecolor=color, alpha=0.9))
     
-    # Set up the plot
-    ax.set_xlim(0, tile_size)
-    ax.set_ylim(tile_size, 0)  # Flip y-axis to match image coordinates
-    ax.set_title(f"Tile: {tile_key}\nBuildings: {len(buildings_in_tile)}")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.grid(True, alpha=0.3)
+    # Add subtle grid
+    ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.5)
+    
+    # Add tile boundary with more prominent styling
+    tile_boundary = patches.Rectangle((0, 0), tile_size, tile_size, 
+                                    linewidth=4, edgecolor='red', 
+                                    facecolor='none', linestyle='-')
+    ax.add_patch(tile_boundary)
+    
+    # Add tile boundary label
+    ax.text(tile_size/2, -20, 'Tile Boundary', ha='center', va='top', 
+           fontsize=10, fontweight='bold', color='red')
     
     plt.tight_layout()
-    plt.show()
+    
+    # Save or show
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Visualization saved to: {save_path}")
+    else:
+        plt.show()
+
+
+def list_available_tiles(data_path, limit=10):
+    """List available tiles in the dataset."""
+    tile_mapping = load_tile_mapping(data_path)
+    if tile_mapping is None:
+        return
+    
+    tiles = list(tile_mapping.keys())
+    print(f"Found {len(tiles)} tiles in the dataset")
+    print(f"Showing first {min(limit, len(tiles))} tiles:")
+    
+    for i, tile_key in enumerate(tiles[:limit]):
+        building_count = len(tile_mapping[tile_key])
+        print(f"  {i+1:2d}. {tile_key} ({building_count} buildings)")
+
 
 def main():
-    # Configuration
-    data_path = pathlib.Path("data/tromso")
-    tile_file = data_path / "tile_to_buildings.json"
+    parser = argparse.ArgumentParser(description="Visualize a tile with its buildings")
+    parser.add_argument("--data_path", type=str, default="data/bergen", 
+                       help="Path to data directory")
+    parser.add_argument("--tile_key", type=str, 
+                       help="Tile key to visualize (e.g., '14544_20_018_00761_3584_0_512')")
+    parser.add_argument("--list_tiles", action="store_true", 
+                       help="List available tiles")
+    parser.add_argument("--no_image", action="store_true", 
+                       help="Don't show background image")
+    parser.add_argument("--save", type=str, 
+                       help="Save visualization to file")
+    parser.add_argument("--limit", type=int, default=10, 
+                       help="Limit number of tiles to list")
     
-    # Check if tile file exists
-    if not tile_file.exists():
-        print(f"Error: Tile file not found at {tile_file}")
-        print("Please run simple_precompute_tiles.py first!")
+    args = parser.parse_args()
+    
+    data_path = pathlib.Path(args.data_path)
+    
+    if args.list_tiles:
+        list_available_tiles(data_path, args.limit)
         return
     
-    # Load the tile-to-buildings mapping
-    print(f"Loading tile mapping from: {tile_file}")
-    with open(tile_file, 'r') as f:
-        tile_to_buildings = json.load(f)
-    
-    print(f"Found {len(tile_to_buildings)} tiles")
-    
-    # Filter tiles that have buildings
-    tiles_with_buildings = {k: v for k, v in tile_to_buildings.items() if len(v) > 0}
-    print(f"Tiles with buildings: {len(tiles_with_buildings)}")
-    
-    if len(tiles_with_buildings) == 0:
-        print("No tiles with buildings found!")
+    if not args.tile_key:
+        print("Error: Please provide a tile_key or use --list_tiles to see available tiles")
+        print("Example: python visualize_tile.py --tile_key '14544_20_018_00761_3584_0_512'")
         return
     
-    # Choose a random tile
-    tile_key = random.choice(list(tiles_with_buildings.keys()))
-    buildings_in_tile = tiles_with_buildings[tile_key]
-    
-    # Visualize it
-    visualize_tile(tile_key, buildings_in_tile, data_path)
+    visualize_tile(args.tile_key, data_path, 
+                  show_image=not args.no_image, 
+                  save_path=args.save)
+
 
 if __name__ == "__main__":
     main()

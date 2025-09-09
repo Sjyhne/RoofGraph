@@ -105,7 +105,7 @@ def visualize_image_buildings(image_id, data_path):
 
 def main():
     # Configuration
-    data_path = pathlib.Path("data/tromso")
+    data_path = pathlib.Path("data/bergen")
     
     # Paths
     buildings_path = data_path / "buildings_transformed"

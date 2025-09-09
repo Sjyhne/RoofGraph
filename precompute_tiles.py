@@ -9,6 +9,8 @@ import pathlib
 import numpy as np
 from rtree import index
 from rasterio.windows import Window
+import argparse
+
 
 def load_building(building_path, building_id):
     """Load a single building JSON file."""
@@ -48,11 +50,11 @@ def create_spatial_index(buildings, image_id):
     return idx
 
 def line_intersects_rectangle(line_start, line_end, rect_x, rect_y, rect_width, rect_height):
-    """Check if a line segment intersects with a rectangle."""
+    """Check if a line segment intersects with a rectangle using proper geometric intersection."""
     x1, y1 = line_start
     x2, y2 = line_end
     
-    # Check if line is completely outside rectangle
+    # Check if line is completely outside rectangle (quick rejection)
     if max(x1, x2) < rect_x or min(x1, x2) > rect_x + rect_width:
         return False
     if max(y1, y2) < rect_y or min(y1, y2) > rect_y + rect_height:
@@ -64,12 +66,52 @@ def line_intersects_rectangle(line_start, line_end, rect_x, rect_y, rect_width, 
     if (rect_x <= x2 < rect_x + rect_width and rect_y <= y2 < rect_y + rect_height):
         return True
     
-    # Check if line crosses rectangle boundary
-    # This is a simplified check - for more accuracy, we'd need proper line-rectangle intersection
-    return True
+    # Check if line crosses rectangle boundary using parametric intersection
+    # Line equation: P = P1 + t * (P2 - P1), where 0 <= t <= 1
+    dx = x2 - x1
+    dy = y2 - y1
+    
+    # Avoid division by zero
+    if abs(dx) < 1e-10 and abs(dy) < 1e-10:
+        return False
+    
+    # Check intersection with rectangle edges
+    # Left edge: x = rect_x
+    if abs(dx) > 1e-10:
+        t = (rect_x - x1) / dx
+        if 0 <= t <= 1:
+            y = y1 + t * dy
+            if rect_y <= y < rect_y + rect_height:
+                return True
+    
+    # Right edge: x = rect_x + rect_width
+    if abs(dx) > 1e-10:
+        t = (rect_x + rect_width - x1) / dx
+        if 0 <= t <= 1:
+            y = y1 + t * dy
+            if rect_y <= y < rect_y + rect_height:
+                return True
+    
+    # Top edge: y = rect_y
+    if abs(dy) > 1e-10:
+        t = (rect_y - y1) / dy
+        if 0 <= t <= 1:
+            x = x1 + t * dx
+            if rect_x <= x < rect_x + rect_width:
+                return True
+    
+    # Bottom edge: y = rect_y + rect_height
+    if abs(dy) > 1e-10:
+        t = (rect_y + rect_height - y1) / dy
+        if 0 <= t <= 1:
+            x = x1 + t * dx
+            if rect_x <= x < rect_x + rect_width:
+                return True
+    
+    return False
 
-def building_intersects_tile(building, image_id, tile_x, tile_y, tile_size):
-    """Check if a building intersects with a specific tile."""
+def building_intersects_tile(building, image_id, tile_x, tile_y, tile_size, min_corner_ratio=0.1):
+    """Check if a building intersects with a specific tile: any corner inside OR any edge intersects."""
     if image_id not in building["corners"]:
         return False
     
@@ -96,10 +138,10 @@ def building_intersects_tile(building, image_id, tile_x, tile_y, tile_size):
     
     return False
 
-def main():
+def main(args):
     # Configuration
-    data_path = pathlib.Path("data/tromso")
-    tile_size = 512
+    data_path = pathlib.Path("data/" + args.data_path)
+    tile_size = args.tile_size
     
     # Paths
     buildings_path = data_path / "buildings_transformed"
@@ -166,7 +208,7 @@ def main():
                 intersecting_buildings = []
                 for i in possible_buildings:
                     building = buildings[i]
-                    if building_intersects_tile(building, image_id, x, y, tile_size):
+                    if building_intersects_tile(building, image_id, x, y, tile_size, args.min_corner_ratio):
                         intersecting_buildings.append(building["id"])
                 
                 # Only keep tiles that have buildings
@@ -184,5 +226,17 @@ def main():
     total_buildings = sum(len(buildings) for buildings in tile_to_buildings.values())
     print(f"Total building-tile associations: {total_buildings}")
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Precompute tiles")
+    parser.add_argument("--data_path", type=str, default="data/rana")
+    parser.add_argument("--tile_size", type=int, default=512)
+    parser.add_argument("--min_corner_ratio", type=float, default=0.1, 
+                       help="Minimum ratio of corners/edges that must intersect with tile")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    main(args)
