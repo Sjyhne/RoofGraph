@@ -28,6 +28,7 @@ class BuildingGraph:
     """Container for a single building's graph data within a tile."""
     corners: torch.Tensor          # Shape: [num_corners, 2] - (x, y) coordinates in tile space
     edges: torch.Tensor            # Shape: [num_edges, 2] - edge connections as corner indices
+    node_types: torch.Tensor       # Shape: [num_corners] - "original" (0) or "boundary" (1) node types
     building_id: int               # Unique building identifier
     num_corners: int               # Number of corners in this building
 
@@ -70,26 +71,26 @@ class BuildingGraphDataset(Dataset):
         print(f"Preserving all buildings and complete geometry per tile")
     
     def _load_all_tiles(self) -> List[Dict]:
-        """Load all tiles from all specified areas."""
+        """Load all tiles from all specified areas using the new tile_buildings_data.json format."""
         tiles = []
         
         for area in self.areas:
             area_path = self.data_path / area
-            mapping_file = area_path / "tile_to_buildings.json"
+            tile_data_file = area_path / "tile_buildings_data.json"
             
-            if not mapping_file.exists():
-                print(f"Warning: No tile mapping found for {area}")
+            if not tile_data_file.exists():
+                print(f"Warning: No tile buildings data found for {area}")
                 continue
             
-            with open(mapping_file, 'r') as f:
+            with open(tile_data_file, 'r') as f:
                 area_tiles = json.load(f)
             
-            for tile_key, building_ids in area_tiles.items():
+            for tile_key, tile_buildings in area_tiles.items():
                 tiles.append({
                     'tile_key': f"{area}_{tile_key}",
                     'area': area,
-                    'building_ids': building_ids,
-                    'original_tile_key': tile_key
+                    'original_tile_key': tile_key,
+                    'tile_buildings': tile_buildings  # Precomputed building data
                 })
         
         return tiles
@@ -136,65 +137,37 @@ class BuildingGraphDataset(Dataset):
             # Return a blank image
             return torch.zeros((3, tile_size, tile_size), dtype=torch.float32)
     
-    def _load_building_data(self, building_id: int, area: str) -> Optional[Dict]:
-        """Load building data from JSON file."""
-        try:
-            building_file = self.data_path / area / "buildings_transformed" / f"{building_id}.json"
-            with open(building_file, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load building {building_id}: {e}")
-            return None
     
     def _extract_building_graphs(self, tile_info: Dict) -> List[BuildingGraph]:
-        """Extract building graphs that intersect with the tile."""
-        area = tile_info['area']
-        tile_key = tile_info['original_tile_key']
-        building_ids = tile_info['building_ids']
-        
-        # Parse tile coordinates
-        parts = tile_key.split('_')
-        image_id = '_'.join(parts[:4])
-        tile_x, tile_y, tile_size = int(parts[4]), int(parts[5]), int(parts[6])
-        
+        """Extract building graphs from precomputed tile data."""
+        tile_buildings = tile_info['tile_buildings']
         graphs = []
         
-        for building_id in building_ids:
-            building = self._load_building_data(building_id, area)
-            if not building:
-                continue
+        for building_data in tile_buildings:
+            corners = np.array(building_data['corners'])
+            node_types = building_data['node_types']
+            edges = building_data['edges']
+            building_id = building_data['id']
             
-            # Get corners in this specific image
-            if image_id not in building.get('corners', {}):
-                continue
-            
-            corners = building['corners'][image_id]
             if len(corners) == 0:
                 continue
             
-            # Convert to tile-relative coordinates
-            tile_corners = []
-            for corner in corners:
-                rel_x = corner[0] - tile_x
-                rel_y = corner[1] - tile_y
-                tile_corners.append([rel_x, rel_y])
-            
             # Normalize coordinates to [0, 1] if requested
             if self.normalize_coords:
-                tile_corners = np.array(tile_corners) / tile_size
-            else:
-                tile_corners = np.array(tile_corners)
+                # Get tile size from tile key
+                tile_key = tile_info['original_tile_key']
+                parts = tile_key.split('_')
+                tile_size = int(parts[-1])  # Last part is tile size
+                corners = corners / tile_size
             
-            # Get edges
-            edges = building.get('edges', [])
-            if len(edges) == 0:
-                continue
+            # Convert node types to numeric (original=0, boundary=1)
+            node_type_values = [0 if nt == "original" else 1 for nt in node_types]
             
             # Convert edges to tensor format
             edge_list = []
             for corner_idx, connected_corners in enumerate(edges):
                 for connected_idx in connected_corners:
-                    if connected_idx < len(tile_corners):
+                    if connected_idx < len(corners):
                         edge_list.append([corner_idx, connected_idx])
             
             if len(edge_list) == 0:
@@ -202,10 +175,11 @@ class BuildingGraphDataset(Dataset):
             
             # Create building graph
             graph = BuildingGraph(
-                corners=torch.tensor(tile_corners, dtype=torch.float32),
+                corners=torch.tensor(corners, dtype=torch.float32),
                 edges=torch.tensor(edge_list, dtype=torch.long),
+                node_types=torch.tensor(node_type_values, dtype=torch.long),
                 building_id=building_id,
-                num_corners=len(tile_corners)
+                num_corners=len(corners)
             )
             graphs.append(graph)
         
@@ -217,21 +191,24 @@ class BuildingGraphDataset(Dataset):
             return {
                 'corners': torch.zeros((0, 2), dtype=torch.float32),
                 'edges': torch.zeros((0, 2), dtype=torch.long),
+                'node_types': torch.zeros(0, dtype=torch.long),
                 'building_ids': torch.zeros(0, dtype=torch.long),
                 'num_corners_per_building': torch.zeros(0, dtype=torch.long),
                 'num_buildings': torch.tensor(0, dtype=torch.long)
             }
         
-        # Collect all corners and edges from all buildings
+        # Collect all corners, edges, and node types from all buildings
         all_corners = []
         all_edges = []
+        all_node_types = []
         building_ids = []
         num_corners_per_building = []
         corner_offset = 0
         
         for graph in graphs:
-            # Add corners
+            # Add corners and node types
             all_corners.append(graph.corners)
+            all_node_types.append(graph.node_types)
             num_corners_per_building.append(graph.num_corners)
             
             # Add edges with global corner indexing
@@ -248,6 +225,7 @@ class BuildingGraphDataset(Dataset):
         return {
             'corners': torch.cat(all_corners, dim=0) if all_corners else torch.zeros((0, 2), dtype=torch.float32),
             'edges': torch.stack(all_edges, dim=0) if all_edges else torch.zeros((0, 2), dtype=torch.long),
+            'node_types': torch.cat(all_node_types, dim=0) if all_node_types else torch.zeros(0, dtype=torch.long),
             'building_ids': torch.tensor(building_ids, dtype=torch.long),
             'num_corners_per_building': torch.tensor(num_corners_per_building, dtype=torch.long),
             'num_buildings': torch.tensor(len(graphs), dtype=torch.long)
@@ -331,6 +309,7 @@ class BuildingGraphDataset(Dataset):
             # Get graph data for this sample
             corners = graphs['corners'][i].numpy()
             edges = graphs['edges'][i].numpy()
+            node_types = graphs['node_types'][i].numpy()
             building_ids = graphs['building_ids'][i].numpy()
             num_corners_per_building = graphs['num_corners_per_building'][i].numpy()
             num_buildings = graphs['num_buildings'][i].item()
@@ -350,12 +329,21 @@ class BuildingGraphDataset(Dataset):
                     
                     num_corners = num_corners_per_building[building_idx]
                     
-                    # Get corners for this building
+                    # Get corners and node types for this building
                     building_corners = corners[corner_offset:corner_offset + num_corners]
+                    building_node_types = node_types[corner_offset:corner_offset + num_corners]
                     
-                    # Draw corners
-                    ax.scatter(building_corners[:, 0], building_corners[:, 1], 
-                              c=color, s=20, alpha=0.8, edgecolors='white', linewidth=0.5)
+                    # Draw corners with different markers for original vs boundary nodes
+                    original_mask = building_node_types == 0
+                    boundary_mask = building_node_types == 1
+                    
+                    if np.any(original_mask):
+                        ax.scatter(building_corners[original_mask, 0], building_corners[original_mask, 1], 
+                                  c=color, s=30, marker='o', alpha=0.8, edgecolors='white', linewidth=0.5, label='Original' if i == 0 else "")
+                    
+                    if np.any(boundary_mask):
+                        ax.scatter(building_corners[boundary_mask, 0], building_corners[boundary_mask, 1], 
+                                  c=color, s=20, marker='s', alpha=0.8, edgecolors='white', linewidth=0.5, label='Boundary' if i == 0 else "")
                     
                     # Draw edges for this building
                     building_edges = []
@@ -422,6 +410,7 @@ class BuildingGraphDataset(Dataset):
             'graphs': {
                 'corners': [sample['graphs']['corners']],
                 'edges': [sample['graphs']['edges']],
+                'node_types': [sample['graphs']['node_types']],
                 'building_ids': [sample['graphs']['building_ids']],
                 'num_corners_per_building': [sample['graphs']['num_corners_per_building']],
                 'num_buildings': sample['graphs']['num_buildings'].unsqueeze(0)
@@ -493,6 +482,7 @@ def collate_fn(batch):
     graphs = {
         'corners': [item['graphs']['corners'] for item in batch],
         'edges': [item['graphs']['edges'] for item in batch],
+        'node_types': [item['graphs']['node_types'] for item in batch],
         'building_ids': [item['graphs']['building_ids'] for item in batch],
         'num_corners_per_building': [item['graphs']['num_corners_per_building'] for item in batch],
         'num_buildings': torch.stack([item['graphs']['num_buildings'] for item in batch])
@@ -513,7 +503,7 @@ if __name__ == "__main__":
     # Create dataset
     dataset = BuildingGraphDataset(
         data_path="data",
-        areas=['bergen'],  # Test with just one area
+        areas=['tromso'],  # Test with just one area
         tile_size=512,
         normalize_coords=True
     )
@@ -528,6 +518,7 @@ if __name__ == "__main__":
         print(f"  Number of buildings: {sample['graphs']['num_buildings'].item()}")
         print(f"  Total corners: {sample['graphs']['corners'].shape[0]}")
         print(f"  Total edges: {sample['graphs']['edges'].shape[0]}")
+        print(f"  Node types: {sample['graphs']['node_types']}")
         print(f"  Corners per building: {sample['graphs']['num_corners_per_building']}")
         print(f"  Building IDs: {sample['graphs']['building_ids']}")
         print(f"  Tile key: {sample['tile_key']}")
@@ -537,7 +528,7 @@ if __name__ == "__main__":
     train_loader, val_loader = create_data_loaders(
         data_path="data",
         areas=['bergen'],
-        batch_size=2,
+        batch_size=4,
         num_workers=0  # Use 0 for debugging
     )
     
@@ -549,8 +540,8 @@ if __name__ == "__main__":
         print(f"\\nBatch data:")
         print(f"  Images shape: {batch['image'].shape}")
         print(f"  Number of samples in batch: {len(batch['graphs']['corners'])}")
-        print(f"  Sample 0 - Corners: {batch['graphs']['corners'][0].shape}, Edges: {batch['graphs']['edges'][0].shape}")
-        print(f"  Sample 1 - Corners: {batch['graphs']['corners'][1].shape}, Edges: {batch['graphs']['edges'][1].shape}")
+        print(f"  Sample 0 - Corners: {batch['graphs']['corners'][0].shape}, Edges: {batch['graphs']['edges'][0].shape}, Node types: {batch['graphs']['node_types'][0].shape}")
+        print(f"  Sample 1 - Corners: {batch['graphs']['corners'][1].shape}, Edges: {batch['graphs']['edges'][1].shape}, Node types: {batch['graphs']['node_types'][1].shape}")
         print(f"  Number of buildings per sample: {batch['graphs']['num_buildings']}")
         
         # Visualize the batch
@@ -561,6 +552,8 @@ if __name__ == "__main__":
     # Test single sample visualization
     print("\\nTesting single sample visualization...")
     sample = dataset[0]
+    dataset.visualize_sample(sample, save_path='single_sample_visualization.png')
+    sample = dataset[1]
     dataset.visualize_sample(sample, save_path='single_sample_visualization.png')
     
     print("\\nDataset test completed!")
