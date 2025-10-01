@@ -49,7 +49,7 @@ class BuildingGraphDataset(Dataset):
     
     def __init__(self, 
                  data_path: str,
-                 areas: List[str] = None,
+                 dataset_type: str = 'train',
                  tile_size: int = 512,
                  transform: Optional[transforms.Compose] = None,
                  normalize_coords: bool = True):
@@ -58,10 +58,12 @@ class BuildingGraphDataset(Dataset):
         self.tile_size = tile_size
         self.transform = transform
         self.normalize_coords = normalize_coords
+
+        if dataset_type == 'train':
+            areas = ['bergen', 'rana', 'stavanger', 'tromso', 'sandvika']
+        elif dataset_type == 'val':
+            areas = ['kristiansand'] # TODO: Add trondheim when ready
         
-        # Default to all areas if none specified
-        if areas is None:
-            areas = ['bergen', 'kristiansand', 'rana', 'sandvika', 'stavanger', 'tromso']
         self.areas = areas
         
         # Load all tile data
@@ -422,8 +424,6 @@ class BuildingGraphDataset(Dataset):
         self.visualize_batch(batch, save_path=save_path, show_building_ids=show_building_ids)
 
 def create_data_loaders(data_path: str,
-                       areas: List[str] = None,
-                       train_split: float = 0.8,
                        batch_size: int = 4,
                        num_workers: int = 2,
                        **dataset_kwargs) -> Tuple[DataLoader, DataLoader]:
@@ -442,14 +442,8 @@ def create_data_loaders(data_path: str,
         Tuple of (train_loader, val_loader)
     """
     # Create full dataset
-    full_dataset = BuildingGraphDataset(data_path, areas=areas, **dataset_kwargs)
-    
-    # Split dataset
-    train_size = int(train_split * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
-    )
+    train_dataset = BuildingGraphDataset(data_path, dataset_type='train', **dataset_kwargs)
+    val_dataset = BuildingGraphDataset(data_path, dataset_type='val', **dataset_kwargs)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -462,7 +456,7 @@ def create_data_loaders(data_path: str,
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=batch_size, 
+        batch_size=1, 
         shuffle=False, 
         num_workers=num_workers,
         collate_fn=collate_fn
@@ -503,7 +497,7 @@ if __name__ == "__main__":
     # Create dataset
     dataset = BuildingGraphDataset(
         data_path="data",
-        areas=['tromso'],  # Test with just one area
+        dataset_type='val',
         tile_size=512,
         normalize_coords=True
     )
@@ -527,7 +521,7 @@ if __name__ == "__main__":
     print("\\nTesting data loaders...")
     train_loader, val_loader = create_data_loaders(
         data_path="data",
-        areas=['bergen'],
+        dataset_type='train',
         batch_size=4,
         num_workers=0  # Use 0 for debugging
     )
@@ -552,8 +546,8 @@ if __name__ == "__main__":
     # Test single sample visualization
     print("\\nTesting single sample visualization...")
     sample = dataset[0]
-    dataset.visualize_sample(sample, save_path='single_sample_visualization.png')
+    dataset.visualize_sample(sample, save_path='single_sample_visualization_1.png')
     sample = dataset[1]
-    dataset.visualize_sample(sample, save_path='single_sample_visualization.png')
+    dataset.visualize_sample(sample, save_path='single_sample_visualization_2.png')
     
     print("\\nDataset test completed!")

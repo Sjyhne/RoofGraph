@@ -10,108 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-import torchvision.models as models
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Any
-import matplotlib.pyplot as plt
-from building_graph_dataset import BuildingGraphDataset, create_data_loaders
+from torch.optim import AdamW
+from typing import Dict, Any
 
-
-class SimpleCNN(nn.Module):
-    """Simple CNN backbone for feature extraction from images."""
-    
-    def __init__(self, input_channels: int = 3, feature_dim: int = 256):
-        super().__init__()
-        
-        # Use ResNet18 as backbone
-        self.backbone = models.resnet18(pretrained=True)
-        
-        # Modify first layer if input channels != 3
-        if input_channels != 3:
-            self.backbone.conv1 = nn.Conv2d(
-                input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-        
-        # Replace classifier with feature extractor
-        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, feature_dim)
-        
-    def forward(self, x):
-        return self.backbone(x)
-
-
-class BuildingGraphPredictor(nn.Module):
-    """
-    Model that predicts building graphs from images.
-    
-    This is a simple baseline that predicts:
-    - Number of buildings in the tile
-    - For each building: number of corners and their coordinates
-    """
-    
-    def __init__(self, 
-                 input_channels: int = 3,
-                 feature_dim: int = 256,
-                 max_buildings: int = 10,
-                 max_corners_per_building: int = 50):
-        super().__init__()
-        
-        self.max_buildings = max_buildings
-        self.max_corners_per_building = max_corners_per_building
-        
-        # Image feature extractor
-        self.feature_extractor = SimpleCNN(input_channels, feature_dim)
-        
-        # Building count predictor
-        self.building_count_head = nn.Sequential(
-            nn.Linear(feature_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, max_buildings + 1)  # 0 to max_buildings
-        )
-        
-        # Corner count predictor (per building)
-        self.corner_count_head = nn.Sequential(
-            nn.Linear(feature_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, max_buildings * (max_corners_per_building + 1))
-        )
-        
-        # Corner coordinate predictor
-        self.corner_coords_head = nn.Sequential(
-            nn.Linear(feature_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, max_buildings * max_corners_per_building * 2),  # x, y coords
-            nn.Sigmoid()  # Normalize to [0, 1]
-        )
-        
-    def forward(self, images):
-        batch_size = images.shape[0]
-        
-        # Extract features
-        features = self.feature_extractor(images)
-        
-        # Predict building counts
-        building_counts = self.building_count_head(features)
-        
-        # Predict corner counts (reshape to [batch, max_buildings, max_corners+1])
-        corner_counts = self.corner_count_head(features)
-        corner_counts = corner_counts.view(batch_size, self.max_buildings, -1)
-        
-        # Predict corner coordinates (reshape to [batch, max_buildings, max_corners, 2])
-        corner_coords = self.corner_coords_head(features)
-        corner_coords = corner_coords.view(
-            batch_size, self.max_buildings, self.max_corners_per_building, 2
-        )
-        
-        return {
-            'building_counts': building_counts,
-            'corner_counts': corner_counts,
-            'corner_coords': corner_coords
-        }
 
 
 class BuildingGraphLightningModule(pl.LightningModule):
@@ -120,27 +21,16 @@ class BuildingGraphLightningModule(pl.LightningModule):
     """
     
     def __init__(self,
-                 model_config: Dict[str, Any] = None,
+                 model: nn.Module,
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
                  scheduler_type: str = "cosine",  # "cosine", "plateau", or "none"
-                 max_buildings: int = 10,
                  max_corners_per_building: int = 50):
         super().__init__()
         
         self.save_hyperparameters()
-        
-        # Model configuration
-        if model_config is None:
-            model_config = {
-                'input_channels': 3,
-                'feature_dim': 256,
-                'max_buildings': max_buildings,
-                'max_corners_per_building': max_corners_per_building
-            }
-        
-        # Initialize model
-        self.model = BuildingGraphPredictor(**model_config)
+
+        self.model = model
         
         # Loss weights
         self.building_count_weight = 1.0
@@ -153,53 +43,8 @@ class BuildingGraphLightningModule(pl.LightningModule):
         
     def forward(self, x):
         return self.model(x)
-    
-    def _prepare_targets(self, batch):
-        """Convert batch data to model targets."""
-        batch_size = len(batch['graphs']['corners'])
-        device = self.device
-        
-        # Initialize target tensors
-        building_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
-        corner_counts = torch.zeros(
-            batch_size, self.hparams.max_buildings, self.hparams.max_corners_per_building + 1, 
-            device=device
-        )
-        corner_coords = torch.zeros(
-            batch_size, self.hparams.max_buildings, self.hparams.max_corners_per_building, 2,
-            device=device
-        )
-        
-        for i in range(batch_size):
-            num_buildings = batch['graphs']['num_buildings'][i].item()
-            building_counts[i] = min(num_buildings, self.hparams.max_buildings)
-            
-            if num_buildings > 0:
-                corners = batch['graphs']['corners'][i]
-                num_corners_per_building = batch['graphs']['num_corners_per_building'][i]
-                
-                corner_offset = 0
-                for b in range(min(num_buildings, self.hparams.max_buildings)):
-                    num_corners = num_corners_per_building[b].item()
-                    num_corners = min(num_corners, self.hparams.max_corners_per_building)
-                    
-                    # One-hot encode corner count
-                    corner_counts[i, b, num_corners] = 1.0
-                    
-                    # Copy corner coordinates
-                    if num_corners > 0:
-                        end_idx = corner_offset + num_corners
-                        building_corners = corners[corner_offset:end_idx]
-                        corner_coords[i, b, :num_corners] = building_corners
-                    
-                    corner_offset += num_corners_per_building[b].item()
-        
-        return {
-            'building_counts': building_counts,
-            'corner_counts': corner_counts,
-            'corner_coords': corner_coords
-        }
-    
+
+
     def _compute_loss(self, predictions, targets):
         """Compute multi-task loss."""
         
@@ -283,65 +128,53 @@ class BuildingGraphLightningModule(pl.LightningModule):
         
         return losses['total_loss']
     
+    def on_train_epoch_end(self):
+        """Called at the end of each training epoch."""
+        # Get logged metrics
+        metrics = self.trainer.callback_metrics
+        
+        # Print aggregate results
+        print(f"\n=== Training Epoch {self.current_epoch} Complete ===")
+        if 'train_loss' in metrics:
+            print(f"Train Loss: {metrics['train_loss']:.4f}")
+        if 'train_building_count_loss' in metrics:
+            print(f"Train Building Count Loss: {metrics['train_building_count_loss']:.4f}")
+        if 'train_corner_count_loss' in metrics:
+            print(f"Train Corner Count Loss: {metrics['train_corner_count_loss']:.4f}")
+        if 'train_coord_loss' in metrics:
+            print(f"Train Coord Loss: {metrics['train_coord_loss']:.4f}")
+        print("=" * 50)
+        
+        # Metrics are automatically logged to wandb through self.log() calls
+    
+    def on_validation_epoch_end(self):
+        """Called at the end of each validation epoch."""
+        # Get logged metrics
+        metrics = self.trainer.callback_metrics
+        
+        # Print aggregate results
+        print(f"\n=== Validation Epoch {self.current_epoch} Complete ===")
+        if 'val_loss' in metrics:
+            print(f"Val Loss: {metrics['val_loss']:.4f}")
+        if 'val_building_count_loss' in metrics:
+            print(f"Val Building Count Loss: {metrics['val_building_count_loss']:.4f}")
+        if 'val_corner_count_loss' in metrics:
+            print(f"Val Corner Count Loss: {metrics['val_corner_count_loss']:.4f}")
+        if 'val_coord_loss' in metrics:
+            print(f"Val Coord Loss: {metrics['val_coord_loss']:.4f}")
+        if 'val_building_count_acc' in metrics:
+            print(f"Val Building Count Accuracy: {metrics['val_building_count_acc']:.4f}")
+        print("=" * 50)
+        
+        # Metrics are automatically logged to wandb through self.log() calls
+    
     def configure_optimizers(self):
         optimizer = AdamW(
             self.parameters(),
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay
         )
-        
-        if self.hparams.scheduler_type == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=100)
-            return [optimizer], [scheduler]
-        elif self.hparams.scheduler_type == "plateau":
-            scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5)
-            return {
-                'optimizer': optimizer,
-                'lr_scheduler': scheduler,
-                'monitor': 'val_loss'
-            }
-        else:
-            return optimizer
-
-
-def create_lightning_data_module(data_path: str,
-                                areas: List[str] = None,
-                                batch_size: int = 4,
-                                num_workers: int = 2,
-                                train_split: float = 0.8,
-                                **dataset_kwargs):
-    """
-    Create PyTorch Lightning DataModule.
-    """
-    
-    class BuildingGraphDataModule(pl.LightningDataModule):
-        def __init__(self):
-            super().__init__()
-            self.data_path = data_path
-            self.areas = areas
-            self.batch_size = batch_size
-            self.num_workers = num_workers
-            self.train_split = train_split
-            self.dataset_kwargs = dataset_kwargs
-            
-        def setup(self, stage=None):
-            # Create data loaders
-            self.train_loader, self.val_loader = create_data_loaders(
-                data_path=self.data_path,
-                areas=self.areas,
-                train_split=self.train_split,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                **self.dataset_kwargs
-            )
-            
-        def train_dataloader(self):
-            return self.train_loader
-            
-        def val_dataloader(self):
-            return self.val_loader
-    
-    return BuildingGraphDataModule()
+        return optimizer
 
 
 # Example usage and testing

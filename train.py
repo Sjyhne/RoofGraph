@@ -6,10 +6,11 @@ Training script for Building Graph Prediction using PyTorch Lightning
 import argparse
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+from building_graph_dataset import create_data_loaders
 import torch
 
-from lightning_module import BuildingGraphLightningModule, create_lightning_data_module
+from lightning_module import BuildingGraphLightningModule
 
 
 def main():
@@ -57,28 +58,20 @@ def main():
                        help='Experiment name for logging')
     parser.add_argument('--log_dir', type=str, default='lightning_logs',
                        help='Directory for logs')
+    parser.add_argument('--use_wandb', action='store_true',
+                       help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='roofgraph',
+                       help='Wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                       help='Wandb entity/team name (optional)')
     
     args = parser.parse_args()
     
     print("=== Building Graph Prediction Training ===")
-    print(f"Data path: {args.data_path}")
-    print(f"Areas: {args.areas}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Max epochs: {args.max_epochs}")
-    print(f"Learning rate: {args.learning_rate}")
-    print(f"Using {'GPU' if args.gpus > 0 else 'CPU'}")
     
-    # Create data module
-    data_module = create_lightning_data_module(
-        data_path=args.data_path,
-        areas=args.areas,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        train_split=args.train_split,
-        tile_size=args.tile_size,
-        normalize_coords=True
-    )
+    train_loader, val_loader = create_data_loaders("data", batch_size=args.batch_size, num_workers=args.num_workers)
     
+
     # Create model
     model_config = {
         'input_channels': 3,
@@ -112,10 +105,20 @@ def main():
     ]
     
     # Create logger
-    logger = TensorBoardLogger(
-        save_dir=args.log_dir,
-        name=args.experiment_name
-    )
+    if args.use_wandb:
+        logger = WandbLogger(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.experiment_name,
+            log_model=True  # Save checkpoints to wandb
+        )
+        print(f"Using Wandb logger - Project: {args.wandb_project}")
+    else:
+        logger = TensorBoardLogger(
+            save_dir=args.log_dir,
+            name=args.experiment_name
+        )
+        print(f"Using TensorBoard logger - Log dir: {args.log_dir}")
     
     # Create trainer
     trainer = pl.Trainer(
@@ -130,7 +133,7 @@ def main():
     
     # Train model
     print("\nStarting training...")
-    trainer.fit(model, data_module)
+    trainer.fit(model)
     
     # Test best model
     print("\nTesting best model...")
